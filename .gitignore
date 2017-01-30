@@ -1,2 +1,7 @@
 #compiled python files
 *.pyc
+
+#pickled data
+*.pkl
+
+.DS_Store
