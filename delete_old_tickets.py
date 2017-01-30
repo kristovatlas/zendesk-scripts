@@ -14,6 +14,17 @@ Authentication: Auth can be performed either with a Username/Password
 combination or Email address/API token combination. For documentation, see:
 https://developer.zendesk.com/rest_api/docs/core/introduction#security-and-authentication
 
+How this works:
+1. Uses the /incremental ticket query API endpoint to find all visible tickets.
+2. Uses the normal /destroy_many API endpoint to put those tickets into a
+"deleted" status, removing their accessibility from the web UI but not the
+/incremental ticket query API endpoint.
+3. Uses an undocumented version of /destroy_many to change sensitive fields
+in the "deleted" tickets to "SCRUBBED" or "x", thus "scrubbing" the tickets.
+
+Note that, at the time of writing this description, you cannot skip step 2 and
+go directly to step 3.
+
 Examples:
 
     Delete all tickets 29 days or older in the "codebros-dot-com" Zendesk domain
@@ -29,104 +40,60 @@ Examples:
 
 """
 
-from warnings import warn
 import re
 import sys
-from time import sleep
 from datetime import datetime, date, timedelta
-import urllib2
 import json
-import socket
 from operator import itemgetter
 from urllib import urlencode
 import const #const.py
 import prompt #prompt.py
-import base64mime #base64mime.py
+import http #http.py
+from common import dprint, const #common.py
 
 const.DEFAULT_DAYS_OLD = 30
-const.AUTH_PASSWORD = 1
-const.AUTH_API_TOKEN = 2
+const.DELETE_ONLY_CLOSED = True
 
-const.NUM_HTTP_RETRIES = 3
-const.NUM_SEC_TIMEOUT = 120
+#deleted|pending|new|solved|hold|closed|open
+const.DELETE_WORTHY_STATUS = ["solved", "closed", "deleted"]
 
-const.NUM_SEC_SLEEP_DEFAULT = 60
-
-const.DEBUG_PRINT = True
-
-class MaxTriesExceededError(Exception):
-    """Max tries for HTTP request exceeeded."""
-    pass
+#set to None to disable; primarily intended for debugging
+const.MAX_TICKETS = None
 
 class ZendeskQueryTypeEnum(object):
     """Specifies which API endpoint to use when enumerating tickets."""
     INCREMENTAL = 1
     SEARCH = 2
 
-const.DEFAULT_QUERY_TYPE = ZendeskQueryTypeEnum.SEARCH
-
-class RequestWithMethod(urllib2.Request):
-    """Extension of `Request` permitting overriding HTTP request method."""
-    def __init__(self, *args, **kwargs):
-        self._method = kwargs.pop('method', None)
-        urllib2.Request.__init__(self, *args, **kwargs)
-
-    def get_method(self):
-        if self._method:
-            return self._method
-        else:
-            return super(RequestWithMethod, self).get_method()
+const.DEFAULT_QUERY_TYPE = ZendeskQueryTypeEnum.INCREMENTAL
 
 def _main():
     args = _get_args()
 
     print "Querying Zendesk for old tickets..."
 
-    tickets = get_all_old_tickets_sorted(args, const.DEFAULT_QUERY_TYPE)
+    tickets = get_all_old_tickets_sorted(
+        args, const.DEFAULT_QUERY_TYPE, const.DELETE_ONLY_CLOSED)
     ids = [ticket[0] for ticket in tickets]
-    print(("Found %d total tickets, with an earliest creation date of '%s' "
-           "(ticket ID %d) and latest creation date of '%s' (ticket ID %d)") %
-          (len(tickets), tickets[0][1], tickets[0][0], tickets[-1][1],
-           tickets[-1][0]))
+    if len(tickets) == 0:
+        print "Could not find any tickets matching the specified criteria."
+    else:
+        print(("Found %d total tickets, with an earliest creation date of '%s' "
+               "(ticket ID %d) and latest creation date of '%s' (ticket ID "
+               "%d)") % (len(tickets), tickets[0][1], tickets[0][0],
+                         tickets[-1][1], tickets[-1][0]))
 
     question = "Delete all %d old tickets?" % len(tickets)
     if prompt.query_yes_no(question, default='yes'):
-        delete_tickets(args, ids)
+        delete_tickets(args, ids, scrub=False)
+        delete_tickets(args, ids, scrub=True)
 
-        tickets = get_all_old_tickets_sorted(args, const.DEFAULT_QUERY_TYPE)
+        tickets = get_all_old_tickets_sorted(
+            args, const.DEFAULT_QUERY_TYPE, const.DELETE_ONLY_CLOSED)
         print "After deletion, %d old tickets remain." % len(tickets)
     else:
         print "No tickets deleted."
 
-def set_auth(request, username, secret, auth_type):
-    """Sets the Basic HTTP Auth creds for an HTTP request to the Zendesk API.
-
-    Args:
-        request (`urllib2`.`Request`): The request object to be modified.
-        username (str): The Zendesk username or email address to authenticate
-            with.
-        secret (str): The password or API key to authenticate with.
-        auth_type (int): Type of authentication to Zendesk API. Valid values:
-            * const.AUTH_PASSWORD
-            * const.AUTH_API_TOKEN
-    See:
-    http://stackoverflow.com/questions/2407126/python-urllib2-basic-auth-problem
-    """
-    assert isinstance(request, urllib2.Request)
-    assert isinstance(username, str)
-    assert isinstance(secret, str)
-    assert isinstance(auth_type, int)
-
-    b64str = ''
-    if auth_type == const.AUTH_PASSWORD:
-        creds = '%s:%s' % (username, secret)
-    elif auth_type == const.AUTH_API_TOKEN:
-        creds = '%s/token:%s' % (username, secret)
-    else:
-        raise ValueError('Invalid auth_type')
-
-    b64str = base64mime.encode(creds).replace('\n', '')
-    request.add_header("Authorization", "Basic %s" % b64str)
 
 def _get_args():
     """Returns the proper args from the command line as well as defaults."""
@@ -176,7 +143,7 @@ def _get_args():
 
     return args
 
-def get_all_old_tickets_sorted(args, query_type):
+def get_all_old_tickets_sorted(args, query_type, closed_only=True):
     """Fetches list of all ticket ID and creation dates for 'old' tickets.
 
     Tickets will be sorted from oldest creation date first to newest last.
@@ -190,6 +157,7 @@ def get_all_old_tickets_sorted(args, query_type):
             * days
         query_type (int): The query endpoint used for fetching ticket data.
             See: `ZendeskQueryTypeNum`
+        closed_only (bool): Include only tickets that have been closed.
 
     Returns:
         List: List of tuples (id, created_at) where "id" is an integer id for
@@ -206,10 +174,12 @@ def get_all_old_tickets_sorted(args, query_type):
 
     old_tickets = []
     for ticket_tuple in tickets:
-        assert len(ticket_tuple) == 2
+        assert len(ticket_tuple) == 3
         ticket_create_date = ticket_tuple[1]
+        ticket_status = ticket_tuple[2]
         if _days_since_today(ticket_create_date) > int(args['days']):
-            old_tickets.append(ticket_tuple)
+            if not closed_only or ticket_status in const.DELETE_WORTHY_STATUS:
+                old_tickets.append(ticket_tuple)
 
     return sorted(old_tickets, key=itemgetter(1))
 
@@ -220,20 +190,35 @@ def get_all_ids_and_creation_dates_search(args):
     subset of all tickets accessible through various other endpoints.
 
     Ticket fields in JSON returned by API:
-    *
+    * created_at
+    * id
+    * status = deleted|pending|new|solved|hold|closed|open
+    ...
+
+    Returns:
+        List of 3-tuples (ticket id, created at YYYY-MM-DD, status)
     """
     url = get_search_url(args['subdomain'], args['days'])
     tickets = []
     while url is not None:
         dprint(url)
-        search_req = urllib2.Request(url)
-        set_auth(search_req, args['username'], args['password'],
-                 args['auth_type'])
+
+        #get_reponse(url, username, password, auth_type, is_delete=False,
+        #                 http_method=const.DEFAULT_HTTP_METHOD)
+
+
+        #search_req = urllib2.Request(url)
+        #set_auth(search_req, args['username'], args['password'],
+        #         args['auth_type'])
         print "Fetching tickets from Zendesk via /search..."
         result = None
         try:
-            result = _fetch_request(search_req)
-        except MaxTriesExceededError:
+            result = http.get_reponse(
+                url=url, username=args['username'], password=args['password'],
+                auth_type=args['auth_type'], is_delete=False,
+                http_method=http.const.CURL)
+
+        except http.MaxTriesExceededError:
             print("WARNING! Maximum number of tries for fetching data was met. "
                   "This may indicate that not all tickets will be returned.")
             return tickets
@@ -244,11 +229,12 @@ def get_all_ids_and_creation_dates_search(args):
                 for ticket in result_json['results']:
                     assert 'created_at' in ticket and 'id' in ticket
                     ticket_id = int(ticket['id'])
+                    ticket_status = ticket['status']
                     matches = re.match(r'^(\d{4}-\d{2}-\d{2}).*$',
                                        ticket['created_at'])
                     if matches is not None and len(matches.groups()) > 0:
                         created_date = matches.group(1)
-                        tickets.append((ticket_id, created_date))
+                        tickets.append((ticket_id, created_date, ticket_status))
                         dprint("Found ticket id %d created %s" %
                                (ticket_id, created_date))
                     else:
@@ -263,6 +249,10 @@ def get_all_ids_and_creation_dates_search(args):
             else:
                 sys.exit("Received unrecognized response from Zendesk API: %s" %
                          str(result_json.read()))
+
+        if const.MAX_TICKETS is not None and len(tickets) >= const.MAX_TICKETS:
+            break
+
     return tickets
 
 def get_all_ids_and_creation_dates_incremental(args):
@@ -275,6 +265,8 @@ def get_all_ids_and_creation_dates_incremental(args):
     Ticket fields in JSON returned by API:
     * created_at
     * id
+    * status = deleted|pending|new|solved|hold|closed|open
+    ...
 
     Args:
         args (`dict`): The list of arguments received in the `_main function:
@@ -284,32 +276,40 @@ def get_all_ids_and_creation_dates_incremental(args):
             * auth_type
 
     Returns:
-        List: List of tuples (id, created_at) where "id" is an integer id for
-            a ticket and "created_at" is a str representing the date that the
-            ticket record was created in YYYY-MM-DD format.
+        List: List of 3-tuples (id, created_at, status) where "id" is an integer
+            id for a ticket, "created_at" is a str representing the date that
+            the ticket record was created in YYYY-MM-DD format, and "status"
+            is a str representing the status of the ticket in Zendesk.
     """
 
     url = get_list_all_tix_url(args['subdomain'])
     tickets = []
     while url is not None:
         dprint(url)
-        search_req = urllib2.Request(url)
-        set_auth(search_req, args['username'], args['password'],
-                 args['auth_type'])
+        #search_req = urllib2.Request(url)
+        #set_auth(search_req, args['username'], args['password'],
+        #         args['auth_type'])
         print "Fetching up to 1000 tickets from Zendesk..."
-        result = _fetch_request(search_req)
+        #result = http.fetch_request(search_req)
+
+        result = http.get_reponse(
+            url=url, username=args['username'], password=args['password'],
+            auth_type=args['auth_type'], is_delete=False,
+            http_method=http.const.CURL)
+
         if result is not None:
             result_json = json.loads(result)
             if 'tickets' in result_json:
-                dprint("Retrived %d tickets" % len(result_json['tickets']))
+                dprint("Received %d tickets" % len(result_json['tickets']))
                 for ticket in result_json['tickets']:
                     assert 'created_at' in ticket and 'id' in ticket
                     ticket_id = int(ticket['id'])
+                    status = ticket['status']
                     matches = re.match(r'^(\d{4}-\d{2}-\d{2}).*$',
                                        ticket['created_at'])
                     if matches is not None and len(matches.groups()) > 0:
                         created_date = matches.group(1)
-                        tickets.append((ticket_id, created_date))
+                        tickets.append((ticket_id, created_date, status))
                         #print("DEBUG: Found ticket id %d created %s" %
                         #      (ticket_id, created_date))
                     else:
@@ -318,14 +318,32 @@ def get_all_ids_and_creation_dates_incremental(args):
 
                 if 'next_page' in result_json:
                     url = result_json['next_page']
-                    if len(tickets) > 100: #DEBUG
-                        url = None  #DEBUG
+                    #if len(tickets) > 100: #DEBUG
+                    #    url = None  #DEBUG
                 else:
                     sys.exit("Expected the 'next_page' field in result "
                              "returned from Zendesk API, but it was missing.")
             else:
-                sys.exit("Received unrecognized response from Zendesk API: %s" %
+                msg = ""
+                try:
+                    msg = ("Received unrecognized response from Zendesk API: %s" %
                          str(result_json.read()))
+                except AttributeError:
+                    msg = ("Received unrecognized response from Zendesk API: %s" %
+                         str(result_json))
+                print msg
+                print("Exiting ticket collection process. Examine the error "
+                      "message above to determine whether tickets may have "
+                      "been missed.")
+                return tickets
+        else:
+            #result was None, usually due to HTTP 422 "Too recent start_time.
+            #Use a start_time older than 5 minutes"
+            url = None
+
+        if const.MAX_TICKETS is not None and len(tickets) >= const.MAX_TICKETS:
+            break
+
     return tickets
 
 def get_search_url(subdomain, days):
@@ -373,6 +391,22 @@ def get_bulk_delete_url(subdomain, ids):
            (subdomain, ids_str))
     return url
 
+def get_scrub_delete_url(subdomain, ids):
+    """Builds a URL that with scrub data from the specified deleted tickets.
+
+    Args:
+        subdomain (str): The Zendesk subdomain for your organization.
+        ids (List[int]): A list of ticket ids to delete. Cannot exceed 100 ids.
+    """
+    if len(ids) > 100:
+        raise OverflowError("Too many ticket ids specified in "
+                            "get_scrub_delete_url().")
+
+    ids_str = ','.join([str(ticket_id) for ticket_id in ids])
+    url = (("https://%s.zendesk.com/api/lotus/tickets/deleted/destroy_many.json"
+            "?ids=%s") % (subdomain, ids_str))
+    return url
+
 def print_usage():
     """Prints syntax for usage and exits the program."""
     print("usage:\tpython delete-old-tickets.py auth-type zendesk-username "
@@ -380,90 +414,7 @@ def print_usage():
           "(Default: 30)]")
     sys.exit()
 
-def _handle_http_429(err):
-    """
-    Todos:
-        Ideally we should get the HTTP response headers and extract the
-        "Retry-After" value to inform us how many seconds we should sleep,
-        but I haven't found a good way to do this with urllib2.
-    """
-    secs = const.NUM_SEC_SLEEP_DEFAULT
-
-    print(("Reached maximum number of requests for Zendesk API  -- waiting for "
-           "%d seconds before trying again.") % secs)
-    sleep(secs)
-
-def _handle_generic_http_err():
-    secs = const.NUM_SEC_SLEEP_DEFAULT
-    print(("Encountered a problem requesting data from the Zendesk API -- "
-           "waiting %d seconds before trying agin.") % secs)
-    sleep(secs)
-
-def _fetch_request(req):
-    """Fetch urllib2 request and handle errors.
-
-    Some Errors that this function handles:
-
-    * HTTP 429: Too Many Requests: Number of requests per time interval for
-        Zendesk user's SLA exceeded. This function will sleep for the number of
-        seconds recommended by the "Retry-After" header, and try again.
-    * HTTP 422: Unprocessable Entity: This can be returned, for example, when
-        accessing the /incremental/tickets.json endpoint with a higher start
-        time than currently exists. In such an instance, the JSON body of the
-        response will be something such as:
-        {"error":"InvalidValue","description":"Too recent start_time.
-        Use a start_time older than 5 minutes"}
-
-    Returns: str if page results can be fetched, otherwise None
-
-    Raises:
-        MaxTriesExceededError: Raised if max # of tries after failure is
-            exceeded.
-    """
-    response = None
-    for _ in range(0, const.NUM_HTTP_RETRIES + 1):
-        try:
-            response = urllib2.urlopen(req, timeout=const.NUM_SEC_TIMEOUT)
-            if response is None:
-                sys.exit("Could not open requested resource.")
-            else:
-                try:
-                    if response.msg != 'OK':
-                        warn("Server message in response: %s" % response.msg)
-                except AttributeError:
-                    pass
-                return response.read()
-
-        except urllib2.HTTPError as err:
-            try:
-                dprint("HTTP %d: %s" % (err.code, err.read()))
-            except Exception:
-                pass
-            if err.code == 422:
-                return None
-            elif err.code == 429:
-                _handle_http_429(err)
-            else:
-                _handle_generic_http_err()
-
-        except urllib2.URLError as err:
-            try:
-                dprint("URLError: %s" % (err.reason))
-            except Exception:
-                pass
-            if err.reason == 'Unprocessable Entity':
-                return None
-            elif err.reason == 'Too Many Requests':
-                _handle_http_429(err)
-            else:
-                _handle_generic_http_err()
-
-        except (socket.timeout, socket.error) as err:
-            _handle_generic_http_err()
-
-    raise MaxTriesExceededError
-
-def delete_tickets(args, ids):
+def delete_tickets(args, ids, scrub=False):
     """Deletes the tickets specified in the search results JSON.
 
     Args:
@@ -473,6 +424,8 @@ def delete_tickets(args, ids):
             * password
             * auth_type
         ids (List[int]): A list of IDs of tickets to delete.
+        scrub (Optioanl[bool]): Indicates whether to do a delete operation or a
+            ticket scrub operation. Default: delete (False)
 
     The bulk delete API operation can only delete up to 100 tickets at a time:
     https://developer.zendesk.com/rest_api/docs/core/tickets#bulk-delete-tickets
@@ -480,13 +433,21 @@ def delete_tickets(args, ids):
     while len(ids) > 0:
         bulk_ids = ids[:100]
         ids = ids[100:]
-        delete_url = get_bulk_delete_url(args['subdomain'], bulk_ids)
+        delete_url = ""
+        if scrub:
+            delete_url = get_scrub_delete_url(args['subdomain'], bulk_ids)
+        else:
+            delete_url = get_bulk_delete_url(args['subdomain'], bulk_ids)
         dprint(delete_url)
-        delete_req = RequestWithMethod(url=delete_url, method='DELETE')
-        set_auth(delete_req, args['username'], args['password'],
-                 args['auth_type'])
+        #delete_req = RequestWithMethod(url=delete_url, method='DELETE')
+        #set_auth(delete_req, args['username'], args['password'],
+        #         args['auth_type'])
 
-        _fetch_request(delete_req)
+        #http.fetch_request(delete_req)
+        resp = http.get_reponse(url=delete_url, username=args['username'],
+            password=args['password'], auth_type=args['auth_type'],
+            is_delete=True, http_method=http.const.CURL)
+        dprint(resp)
 
 def _days_since_today(original_date):
     """Get number of days since the specified date, as of now.
@@ -497,10 +458,7 @@ def _days_since_today(original_date):
     diff = datetime.today() - datetime.strptime(original_date, "%Y-%m-%d")
     return diff.days
 
-def dprint(string):
-    """Prints debug information if DEBUG_PRINT mode is enabled."""
-    if const.DEBUG_PRINT:
-        print "DEBUG: %s" % str(string)
+
 
 if __name__ == '__main__':
     _main()
